@@ -24,7 +24,9 @@ import (
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 	"tailscale.com/client/tailscale"
+	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/net/tsaddr"
+	"tailscale.com/tailcfg"
 )
 
 func init() {
@@ -44,11 +46,21 @@ func (Middleware) CaddyModule() caddy.ModuleInfo {
 // the Tailscale network and sets placeholders based on the Tailscale
 // node information.
 type Middleware struct {
-	RawAllowed []string `json:"allowed,omitempty"`
-	Allowed    *Allowed
+	RawAllowed   []string `json:"allowed,omitempty"`
+	requirements *Requirements
 
-	Logger *zap.Logger
+	logger *zap.Logger
 }
+
+type Requirements struct {
+	Ranges       []netip.Prefix
+	Logins       []string
+	Capabilities []string
+}
+
+const (
+	TailscaleAdminCap = tailcfg.NodeCapability("https://tailscale.com/cap/is-admin")
+)
 
 // ServeHTTP implements the caddyhttp.MiddlewareHandler interface.
 func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
@@ -62,7 +74,7 @@ func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
 
-	if m.Allowed.IsIpAllowed(ip) {
+	if m.requirements.IsIpAllowed(ip) {
 		return next.ServeHTTP(w, r)
 	}
 
@@ -80,34 +92,32 @@ func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
 
-	if !m.Allowed.IsLoginAllowed(whois.UserProfile.LoginName) {
+	m.logger.Debug("Tailscale user:", zap.Any("user", whois.Node.User), zap.Any("capabilities", whois.Node.CapMap))
+
+	if !m.requirements.IsWhoIsLegal(whois) {
 		return caddyhttp.Error(http.StatusForbidden, errors.New(fmt.Sprintf("User %s,%s not authorized", whois.UserProfile.DisplayName, whois.UserProfile.LoginName)))
 	}
 
 	caddyhttp.SetVar(r.Context(), "tailscale.name", whois.UserProfile.DisplayName)
 	caddyhttp.SetVar(r.Context(), "tailscale.email", whois.UserProfile.LoginName)
+	caddyhttp.SetVar(r.Context(), "tailscale.is-admin", whois.Node.HasCap(TailscaleAdminCap))
 
 	return next.ServeHTTP(w, r)
 }
 
 func (m *Middleware) Provision(ctx caddy.Context) error {
-	m.Logger = ctx.Logger() // g.logger is a *zap.Logger
-	m.Logger.Debug("", zap.Strings("allowed", m.RawAllowed))
+	m.logger = ctx.Logger() // g.logger is a *zap.Logger
+	m.logger.Debug("", zap.Strings("allowed", m.RawAllowed))
 	if allowed, err := parseAllowed(m.RawAllowed); err != nil {
 		return err
 	} else {
-		m.Allowed = allowed
-		m.Logger.Debug("Allowed: ", zap.String("ips", fmt.Sprintf("%s", allowed.Ranges)), zap.String("logins", fmt.Sprintf("%s", allowed.Logins)))
+		m.requirements = allowed
+		m.logger.Debug("Allowed: ", zap.Any("", allowed))
 	}
 	return nil
 }
 
-type Allowed struct {
-	Ranges []netip.Prefix
-	Logins []string
-}
-
-func (a Allowed) IsIpAllowed(ip netip.Addr) bool {
+func (a Requirements) IsIpAllowed(ip netip.Addr) bool {
 	for _, r := range a.Ranges {
 		if r.Contains(ip) {
 			return true
@@ -116,13 +126,26 @@ func (a Allowed) IsIpAllowed(ip netip.Addr) bool {
 	return false
 }
 
-func (a Allowed) IsLoginAllowed(s string) bool {
+func (a Requirements) IsLoginAllowed(s string) bool {
 	return slices.Contains(a.Logins, s)
 }
+func (a Requirements) HasCapacities(m tailcfg.NodeCapMap) bool {
+	for _, e := range a.Capabilities {
+		if !m.Contains(tailcfg.NodeCapability(e)) {
+			return false
+		}
+	}
+	return true
+}
 
-func parseAllowed(args []string) (*Allowed, error) {
-	var ranges = make([]netip.Prefix, len(args))
-	var emails = make([]string, len(args))
+func (a Requirements) IsWhoIsLegal(whoIs *apitype.WhoIsResponse) bool {
+	return a.HasCapacities(whoIs.Node.CapMap) || a.IsLoginAllowed(whoIs.UserProfile.LoginName)
+}
+
+func parseAllowed(args []string) (*Requirements, error) {
+	var ranges = make([]netip.Prefix, 0, len(args))
+	var emails = make([]string, 0, len(args))
+	var caps = make([]string, 0, len(args))
 	for _, s := range args {
 		before, after, found := strings.Cut(s, ":")
 		if found {
@@ -135,7 +158,8 @@ func parseAllowed(args []string) (*Allowed, error) {
 				ranges = append(ranges, rg)
 			case LoginPrefix:
 				emails = append(emails, after)
-
+			case CapabilityPrefix:
+				caps = append(caps, after)
 			default:
 				return nil, errors.New("Unknown prefix")
 			}
@@ -146,12 +170,12 @@ func parseAllowed(args []string) (*Allowed, error) {
 				continue
 			}
 			emails = append(emails, before)
-
 		}
 	}
-	return &Allowed{
-		Ranges: ranges,
-		Logins: emails,
+	return &Requirements{
+		Ranges:       ranges,
+		Logins:       emails,
+		Capabilities: caps,
 	}, nil
 }
 
@@ -163,8 +187,9 @@ func parseAsRangeOrIp(s2 string) (netip.Prefix, error) {
 }
 
 const (
-	RangePrefix = "ip"
-	LoginPrefix = "login"
+	RangePrefix      = "ip"
+	LoginPrefix      = "login"
+	CapabilityPrefix = "cap"
 )
 
 // UnmarshalCaddyfile implements the caddyfile.Unmarshaler interface.
