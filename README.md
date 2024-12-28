@@ -1,7 +1,3 @@
-`tsid` is no longer maintained. Feel free to fork.
-
----
-
 `tsid` is a [Caddy] plugin that allows access only to requests
 coming from the [Tailscale] network and allows to identify users
 behind these requests by setting some [Caddy] [placeholders]:
