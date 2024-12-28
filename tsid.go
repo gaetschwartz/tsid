@@ -1,4 +1,4 @@
-// © 2021 Ilya Mateyko. All rights reserved.
+// © 2024 Gaëtan Schwartz. All rights reserved.
 // Use of this source code is governed by the MIT
 // license that can be found in the LICENSE.md file.
 
@@ -9,15 +9,20 @@ package tsid
 
 import (
 	"errors"
+	"fmt"
+	"log"
 	"net"
 	"net/http"
+	"net/netip"
+	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"inet.af/netaddr"
+	"go.uber.org/zap"
 	"tailscale.com/client/tailscale"
 	"tailscale.com/net/tsaddr"
 )
@@ -38,30 +43,45 @@ func (Middleware) CaddyModule() caddy.ModuleInfo {
 // Middleware is a Caddy HTTP handler that allows requests only from
 // the Tailscale network and sets placeholders based on the Tailscale
 // node information.
-type Middleware struct{}
+type Middleware struct {
+	RawAllowed []string `json:"allowed,omitempty"`
+	Allowed    *Allowed
+
+	Logger *zap.Logger
+}
 
 // ServeHTTP implements the caddyhttp.MiddlewareHandler interface.
-func (Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+func (m *Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	ipStr, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError, err)
 	}
 
-	ip, err := netaddr.ParseIP(ipStr)
+	ip, err := netip.ParseAddr(ipStr)
 	if err != nil {
 		return caddyhttp.Error(http.StatusInternalServerError, err)
+	}
+
+	if m.Allowed.IsIpAllowed(ip) {
+		return next.ServeHTTP(w, r)
 	}
 
 	if !tsaddr.IsTailscaleIP(ip) {
-		return caddyhttp.Error(http.StatusForbidden, errors.New("not a Tailscale IP"))
+		return caddyhttp.Error(http.StatusForbidden, errors.New(fmt.Sprintf("Not a Tailscale IP: %s", ip.String())))
 	}
 
-	whois, err := tailscale.WhoIs(r.Context(), r.RemoteAddr)
+	client := tailscale.LocalClient{}
+
+	whois, err := client.WhoIs(r.Context(), r.RemoteAddr)
 	if err != nil {
-		if strings.Contains(err.Error(), "no match for IP:port") {
-			return caddyhttp.Error(http.StatusForbidden, errors.New("not authorized"))
+		if errors.Is(err, tailscale.ErrPeerNotFound) {
+			return caddyhttp.Error(http.StatusForbidden, errors.New(fmt.Sprintf("Not found: %s", ip.String())))
 		}
 		return caddyhttp.Error(http.StatusInternalServerError, err)
+	}
+
+	if !m.Allowed.IsLoginAllowed(whois.UserProfile.LoginName) {
+		return caddyhttp.Error(http.StatusForbidden, errors.New(fmt.Sprintf("User %s,%s not authorized", whois.UserProfile.DisplayName, whois.UserProfile.LoginName)))
 	}
 
 	caddyhttp.SetVar(r.Context(), "tailscale.name", whois.UserProfile.DisplayName)
@@ -70,8 +90,91 @@ func (Middleware) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return next.ServeHTTP(w, r)
 }
 
+func (m *Middleware) Provision(ctx caddy.Context) error {
+	m.Logger = ctx.Logger() // g.logger is a *zap.Logger
+	m.Logger.Debug("", zap.Strings("allowed", m.RawAllowed))
+	if allowed, err := parseAllowed(m.RawAllowed); err != nil {
+		return err
+	} else {
+		m.Allowed = allowed
+		m.Logger.Debug("Allowed: ", zap.String("ips", fmt.Sprintf("%s", allowed.Ranges)), zap.String("logins", fmt.Sprintf("%s", allowed.Logins)))
+	}
+	return nil
+}
+
+type Allowed struct {
+	Ranges []netip.Prefix
+	Logins []string
+}
+
+func (a Allowed) IsIpAllowed(ip netip.Addr) bool {
+	for _, r := range a.Ranges {
+		if r.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a Allowed) IsLoginAllowed(s string) bool {
+	return slices.Contains(a.Logins, s)
+}
+
+func parseAllowed(args []string) (*Allowed, error) {
+	var ranges = make([]netip.Prefix, len(args))
+	var emails = make([]string, len(args))
+	for _, s := range args {
+		before, after, found := strings.Cut(s, ":")
+		if found {
+			switch before {
+			case RangePrefix:
+				rg, err := parseAsRangeOrIp(after)
+				if err != nil {
+					return nil, err
+				}
+				ranges = append(ranges, rg)
+			case LoginPrefix:
+				emails = append(emails, after)
+
+			default:
+				return nil, errors.New("Unknown prefix")
+			}
+		} else {
+			rg, err := parseAsRangeOrIp(before)
+			if err == nil {
+				ranges = append(ranges, rg)
+				continue
+			}
+			emails = append(emails, before)
+
+		}
+	}
+	return &Allowed{
+		Ranges: ranges,
+		Logins: emails,
+	}, nil
+}
+
+func parseAsRangeOrIp(s2 string) (netip.Prefix, error) {
+	if !strings.Contains(s2, "/") {
+		s2 = s2 + "/32"
+	}
+	return netip.ParsePrefix(s2)
+}
+
+const (
+	RangePrefix = "ip"
+	LoginPrefix = "login"
+)
+
 // UnmarshalCaddyfile implements the caddyfile.Unmarshaler interface.
-func (Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error { return nil }
+func (m *Middleware) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	d.Next() // consume directive name
+
+	// store the argument
+	m.RawAllowed = d.RemainingArgs()
+	return nil
+}
 
 // parseCaddyfileHandler unmarshals tokens from h into a new middleware handler value.
 func parseCaddyfileHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
@@ -80,8 +183,26 @@ func parseCaddyfileHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler,
 	return m, err
 }
 
+func isWithinRange(ip netip.Addr, p netip.Prefix) bool {
+	return p.Contains(ip)
+}
+
 // Interface guards.
 var (
 	_ caddyhttp.MiddlewareHandler = (*Middleware)(nil)
+	_ caddy.Provisioner           = (*Middleware)(nil)
 	_ caddyfile.Unmarshaler       = (*Middleware)(nil)
 )
+
+const LenientEmailRegexString = "^[^@]+@[^@]+\\.[^@]+$"
+
+var LenientEmailRegex *regexp.Regexp
+
+func init() {
+	emailRegex, err := regexp.Compile(LenientEmailRegexString)
+	if err != nil {
+		log.Fatalln("invalid email regex: ", err)
+	} else {
+		LenientEmailRegex = emailRegex
+	}
+}
